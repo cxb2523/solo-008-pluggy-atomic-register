@@ -399,6 +399,165 @@ def test_register_both_wrapper_and_hookwrapper(he_pm: PluginManager) -> None:
     assert excinfo.value.plugin is plugin
 
 
+def test_register_blocked_name_is_atomic(pm: PluginManager) -> None:
+    class Plugin:
+        pass
+
+    pm.set_blocked("taken")
+    assert pm.register(Plugin(), "taken") is None
+    assert pm.get_plugins() == set()
+    assert pm.list_name_plugin() == [("taken", None)]
+    assert pm.is_blocked("taken")
+
+
+def test_register_duplicate_plugin_is_atomic(pm: PluginManager) -> None:
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return arg
+
+    plugin = Plugin()
+    assert pm.register(plugin, "first") == "first"
+    before = pm.hook.he_method1.get_hookimpls()
+    with pytest.raises(ValueError, match="already registered under a different name"):
+        pm.register(plugin, "second")
+    assert pm.get_plugins() == {plugin}
+    assert pm.get_name(plugin) == "first"
+    assert pm.list_name_plugin() == [("first", plugin)]
+    assert not pm.has_plugin("second")
+    assert pm.hook.he_method1.get_hookimpls() == before
+    assert pm.hook.he_method1(arg=1) == [1]
+
+
+def test_register_same_name_is_atomic(pm: PluginManager) -> None:
+    class First:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return "first"
+
+    class Second:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return "second"  # pragma: no cover
+
+    first = First()
+    assert pm.register(first, "dup") == "dup"
+    with pytest.raises(ValueError, match="Plugin name already registered"):
+        pm.register(Second(), "dup")
+    assert pm.get_plugin("dup") is first
+    assert pm.get_plugins() == {first}
+    impls = pm.hook.he_method1.get_hookimpls()
+    assert [impl.plugin for impl in impls] == [first]
+    assert pm.hook.he_method1(arg=1) == ["first"]
+
+
+def test_register_hook_validation_failure_is_atomic() -> None:
+    test_pm = PluginManager("example")
+
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg: object) -> object: ...
+
+        @hookspec
+        def he_method2(self, arg: object) -> object: ...
+
+    test_pm.add_hookspecs(Hooks)
+
+    class Good:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return "good"
+
+    good = Good()
+    test_pm.register(good)
+
+    class Bad:
+        # An unknown hook sorts first and would create a new HookCaller; the
+        # later validation failure must not leave that empty slot behind.
+        @hookimpl
+        def brand_new_hook(self) -> None: ...
+
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return "bad"  # pragma: no cover
+
+        @hookimpl
+        def he_method2(self, bogus_arg: object) -> None:
+            pass  # pragma: no cover
+
+    bad = Bad()
+    with pytest.raises(PluginValidationError) as excinfo:
+        test_pm.register(bad, "bad")
+    assert excinfo.value.plugin is bad
+
+    assert test_pm.get_plugins() == {good}
+    assert test_pm.get_name(bad) is None
+    assert not hasattr(test_pm.hook, "brand_new_hook")
+    assert [impl.plugin for impl in test_pm.hook.he_method1.get_hookimpls()] == [good]
+    assert test_pm.hook.he_method1.get_hookimpls()
+    assert test_pm.hook.he_method2.get_hookimpls() == []
+    assert test_pm.hook.he_method1(arg=1) == ["good"]
+
+
+def test_register_succeeds_after_failure(he_pm: PluginManager) -> None:
+    class Good1:
+        @hookimpl
+        def he_method1(self, arg: object) -> list[object]:
+            return [1]
+
+    class Bad:
+        @hookimpl
+        def he_method1(self, arg: object, bogus: object) -> None:
+            pass  # pragma: no cover
+
+    class Good2:
+        @hookimpl
+        def he_method1(self, arg: object) -> list[object]:
+            return [2]
+
+    good1 = Good1()
+    assert he_pm.register(good1, "good1") == "good1"
+    with pytest.raises(PluginValidationError):
+        he_pm.register(Bad(), "bad")
+    good2 = Good2()
+    assert he_pm.register(good2, "good2") == "good2"
+
+    assert he_pm.get_plugins() == {good1, good2}
+    assert he_pm.list_name_plugin() == [
+        ("good1", good1),
+        ("good2", good2),
+    ]
+    assert [impl.plugin for impl in he_pm.hook.he_method1.get_hookimpls()] == [
+        good1,
+        good2,
+    ]
+    assert he_pm.hook.he_method1(arg=0) == [[2], [1]]
+
+
+def test_unregister_after_failed_register(he_pm: PluginManager) -> None:
+    class Good:
+        @hookimpl
+        def he_method1(self, arg: object) -> list[object]:
+            return [1]
+
+    class Bad:
+        @hookimpl
+        def he_method1(self, arg: object, bogus: object) -> None:
+            pass  # pragma: no cover
+
+    good = Good()
+    he_pm.register(good, "good")
+    bad = Bad()
+    with pytest.raises(PluginValidationError):
+        he_pm.register(bad, "bad")
+
+    assert he_pm.unregister(name="bad") is None
+    assert he_pm.unregister(good) is good
+    assert he_pm.get_plugins() == set()
+    assert he_pm.hook.he_method1.get_hookimpls() == []
+    assert he_pm.hook.he_method1(arg=1) == []
+
+
 def test_register(pm: PluginManager) -> None:
     class MyPlugin:
         @hookimpl
