@@ -215,11 +215,11 @@ class PluginManager:
                 f"{plugin_name}={plugin}\n{self._name2plugin}"
             )
 
-        # XXX if an error happens we should make sure no state has been
-        # changed at point of return
-        self._name2plugin[plugin_name] = plugin
-
-        # register matching hook implementations of the plugin
+        # Validate every hook implementation and resolve its hook caller
+        # before touching any manager state, so a failed registration leaves
+        # the manager (plugin order, hook lists, call history) untouched.
+        pending: list[tuple[HookImpl, HookCaller]] = []
+        new_hookcallers: list[tuple[str, HookCaller]] = []
         for attr_name in dir(plugin):
             hookimpl_opts = self.parse_hookimpl_opts(plugin, attr_name)
             if hookimpl_opts is not None:
@@ -235,12 +235,34 @@ class PluginManager:
                 hook_name = hookimpl_opts.get("specname") or attr_name
                 hook: HookCaller | None = getattr(self.hook, hook_name, None)
                 if hook is None:
+                    # Raises before any state change if the name cannot be
+                    # attached to the relay (e.g. "__dict__").
                     hook = HookCaller(hook_name, self._hookexec)
-                    setattr(self.hook, hook_name, hook)
+                    new_hookcallers.append((hook_name, hook))
                 elif hook.has_spec():
                     self._verify_hook(hook, hookimpl)
+                pending.append((hookimpl, hook))
+
+        # All checks passed: commit atomically. If a commit step still raises
+        # (e.g. a historic replay executing user code), undo every committed
+        # change instead of leaving the manager half-registered.
+        self._name2plugin[plugin_name] = plugin
+        try:
+            for hook_name, hook in new_hookcallers:
+                setattr(self.hook, hook_name, hook)
+            for hookimpl, hook in pending:
+                if hook.has_spec():
                     hook._maybe_apply_history(hookimpl)
                 hook._add_hookimpl(hookimpl)
+        except BaseException:
+            for hookimpl, hook in pending:
+                if hookimpl in hook._hookimpls:
+                    hook._hookimpls.remove(hookimpl)
+            for hook_name, hook in new_hookcallers:
+                if self.hook.__dict__.get(hook_name) is hook:
+                    del self.hook.__dict__[hook_name]
+            del self._name2plugin[plugin_name]
+            raise
         return plugin_name
 
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:

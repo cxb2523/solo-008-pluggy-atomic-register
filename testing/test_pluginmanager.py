@@ -29,6 +29,169 @@ def test_plugin_double_register(pm: PluginManager) -> None:
         pm.register(42, name="def")
 
 
+def test_register_invalid_name_is_atomic(he_pm: PluginManager) -> None:
+    """A hookimpl whose name can't be attached to the relay fails atomically.
+
+    ``__dict__`` shadows the relay's own mapping, so assigning a caller with
+    that name raises; neither the plugin nor a partial hook slot may remain.
+    """
+
+    class BadName:
+        @hookimpl(specname="__dict__")
+        def he_method1(self, arg: object) -> object:
+            return arg  # pragma: no cover
+
+    plugin = BadName()
+    with pytest.raises(AttributeError):
+        he_pm.register(plugin)
+
+    assert he_pm.get_plugins() == set()
+    assert not he_pm.is_registered(plugin)
+    assert he_pm.list_name_plugin() == []
+    assert list(he_pm.hook.__dict__) == ["he_method1"]
+    assert he_pm.get_hookcallers(plugin) is None
+    assert he_pm.hook.he_method1(arg=1) == []
+
+
+def test_register_duplicate_plugin_is_atomic(pm: PluginManager) -> None:
+    """Registering an already registered plugin under another name changes nothing."""
+
+    class A:
+        pass
+
+    a1, a2 = A(), A()
+    assert pm.register(a1, name="first") == "first"
+    assert pm.register(a2, name="second") == "second"
+
+    with pytest.raises(ValueError, match="already registered"):
+        pm.register(a1, name="third")
+
+    assert pm.get_plugins() == {a1, a2}
+    assert pm.list_name_plugin() == [("first", a1), ("second", a2)]
+    assert not pm.has_plugin("third")
+
+
+def test_register_duplicate_name_is_atomic(pm: PluginManager) -> None:
+    """A new plugin colliding with an occupied name leaves that name intact."""
+
+    class A:
+        pass
+
+    class B:
+        pass
+
+    a1, b1 = A(), B()
+    assert pm.register(a1, name="name") == "name"
+
+    with pytest.raises(ValueError, match="Plugin name already registered"):
+        pm.register(b1, name="name")
+
+    assert pm.get_plugin("name") is a1
+    assert pm.get_name(a1) == "name"
+    assert not pm.is_registered(b1)
+    assert pm.get_plugins() == {a1}
+
+
+def test_register_hook_validation_failure_is_atomic(he_pm: PluginManager) -> None:
+    """Failing hook validation rolls back plugin, hooks and call history.
+
+    Class attributes are discovered alphabetically: ``aaa_new_hook`` would
+    create a fresh HookCaller before ``he_method1`` fails spec verification,
+    so the new empty slot must be removed instead of left dangling.
+    """
+
+    class Good:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return arg + 10
+
+    good = Good()
+    he_pm.register(good)
+
+    class Bad:
+        @hookimpl(specname="he_brand_new_hook")
+        def aaa_new_hook(self) -> object:
+            return 1  # pragma: no cover
+
+        @hookimpl
+        def he_method1(self, bogus_arg: object) -> None:
+            pass  # pragma: no cover
+
+    bad = Bad()
+    with pytest.raises(PluginValidationError) as excinfo:
+        he_pm.register(bad)
+    assert excinfo.value.plugin is bad
+
+    assert he_pm.get_plugins() == {good}
+    assert he_pm.list_name_plugin() == [(he_pm.get_name(good), good)]
+    assert list(he_pm.hook.__dict__) == ["he_method1"]
+    assert he_pm.get_hookcallers(bad) is None
+    assert he_pm.hook.he_method1.get_hookimpls() and all(
+        impl.plugin is not bad for impl in he_pm.hook.he_method1.get_hookimpls()
+    )
+    assert he_pm.hook.he_method1(arg=1) == [11]
+
+
+def test_register_after_failure_works(he_pm: PluginManager) -> None:
+    """A failed attempt neither occupies the name nor poisons later registration."""
+
+    class Fixed:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return arg + 1
+
+    class Broken:
+        @hookimpl
+        def he_method1(self, bogus_arg: object) -> None:
+            pass  # pragma: no cover
+
+    broken = Broken()
+    with pytest.raises(PluginValidationError):
+        he_pm.register(broken, name="plug")
+
+    fixed = Fixed()
+    assert he_pm.register(fixed, name="plug") == "plug"
+    assert he_pm.get_plugin("plug") is fixed
+    assert he_pm.get_plugins() == {fixed}
+    assert he_pm.hook.he_method1(arg=1) == [2]
+
+    # Even a plugin identical to the failed one can be fixed and registered
+    # under its canonical name; the failed object's name slot is reusable.
+    assert not he_pm.is_registered(broken)
+    assert he_pm.register(Fixed()) is not None
+
+
+def test_unregister_after_failed_register(he_pm: PluginManager) -> None:
+    """After a failed registration, unregister touches only real plugins."""
+
+    class Good:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return arg + 100
+
+    class Bad:
+        @hookimpl
+        def he_method1(self, bogus_arg: object) -> None:
+            pass  # pragma: no cover
+
+    good = Good()
+    he_pm.register(good, name="good")
+
+    bad = Bad()
+    with pytest.raises(PluginValidationError):
+        he_pm.register(bad, name="bad")
+
+    with pytest.raises(AssertionError, match="not registered"):
+        he_pm.unregister(bad)
+    assert he_pm.unregister(name="bad") is None
+    assert he_pm.get_plugins() == {good}
+    assert he_pm.hook.he_method1(arg=1) == [101]
+
+    assert he_pm.unregister(good) is good
+    assert he_pm.get_plugins() == set()
+    assert he_pm.hook.he_method1(arg=1) == []
+
+
 def test_register_rejects_none(pm: PluginManager) -> None:
     """``None`` collides with the blocked-name sentinel and must be rejected."""
     with pytest.raises(TypeError, match="plugin must not be None"):
